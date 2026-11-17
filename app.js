@@ -271,7 +271,7 @@ function setupKakaoMapInstance() {
   });
 
   renderAll();
-  fitMapBounds();
+  scheduleMapResizeAndFit();
 }
 
 // 2) 키 없이도 즉시 작동하는 미리보기 지도(Leaflet) 초기화
@@ -291,10 +291,25 @@ function initPreviewLeafletMap() {
 
   L.control.zoom({ position: "bottomleft" }).addTo(state.leafletMap);
 
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-    attribution: "&copy; OpenStreetMap & CartoDB",
-    maxZoom: 19,
-  }).addTo(state.leafletMap);
+  const primaryTiles = L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+    {
+      attribution: "&copy; OpenStreetMap & CartoDB",
+      maxZoom: 19,
+    }
+  ).addTo(state.leafletMap);
+
+  // 모바일 네트워크 등에서 타일 로드 실패 시 표준 OSM 타일로 자동 백업
+  let fallbackAdded = false;
+  primaryTiles.on("tileerror", () => {
+    if (!fallbackAdded && state.leafletMap) {
+      fallbackAdded = true;
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "&copy; OpenStreetMap contributors",
+        maxZoom: 19,
+      }).addTo(state.leafletMap);
+    }
+  });
 
   state.leafletLayerGroup = L.layerGroup().addTo(state.leafletMap);
 
@@ -310,7 +325,29 @@ function initPreviewLeafletMap() {
   });
 
   renderAll();
+  scheduleMapResizeAndFit();
+}
+
+// 모바일 브라우저 주소창 변화 및 초기 렌더링 직후 지도 크기 재계산
+function refreshMapLayout() {
+  if (state.engine === "kakao" && state.kakaoMap) {
+    state.kakaoMap.relayout();
+  } else if (state.leafletMap) {
+    state.leafletMap.invalidateSize();
+  }
+}
+
+function scheduleMapResizeAndFit() {
+  refreshMapLayout();
   fitMapBounds();
+  setTimeout(() => {
+    refreshMapLayout();
+    fitMapBounds();
+  }, 150);
+  setTimeout(() => {
+    refreshMapLayout();
+    fitMapBounds();
+  }, 450);
 }
 
 function updateEngineStatusUI(mode, text) {
@@ -571,13 +608,17 @@ function fitMapBounds() {
   const records = getCurrentRecords();
   if (records.length === 0) return;
 
+  refreshMapLayout();
+  const isMobile = window.innerWidth <= 820;
+  const pad = isMobile ? [28, 28] : [60, 60];
+
   if (state.engine === "kakao" && state.kakaoMap) {
     const bounds = new kakao.maps.LatLngBounds();
     records.forEach((r) => bounds.extend(new kakao.maps.LatLng(r.lat, r.lng)));
     state.kakaoMap.setBounds(bounds);
   } else if (state.leafletMap) {
     const bounds = L.latLngBounds(records.map((r) => [r.lat, r.lng]));
-    state.leafletMap.fitBounds(bounds, { padding: [60, 60], maxZoom: 15 });
+    state.leafletMap.fitBounds(bounds, { padding: pad, maxZoom: 15 });
   }
 }
 
@@ -947,6 +988,18 @@ document.addEventListener("DOMContentLoaded", () => {
     saveDataToStorage();
     renderAll();
   });
+
+  // 모바일 화면 회전 및 주소창 크기 변화 대응
+  window.addEventListener("resize", () => {
+    refreshMapLayout();
+  });
+  const mapSectionEl = document.querySelector(".map-section");
+  if (window.ResizeObserver && mapSectionEl) {
+    const ro = new ResizeObserver(() => {
+      refreshMapLayout();
+    });
+    ro.observe(mapSectionEl);
+  }
 
   // 지도 엔진 시작!
   initMapEngine();
