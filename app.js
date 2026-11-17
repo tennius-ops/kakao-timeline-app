@@ -6,6 +6,10 @@
 
 const STORAGE_KEY_DATA = "kakao_timeline_records_v1";
 const STORAGE_KEY_API = "kakao_timeline_js_key";
+const STORAGE_KEY_AUTOTRACK = "kakao_timeline_autotrack_v1";
+
+// 💡 여기에 카카오 JavaScript 키를 미리 넣어두면 어떤 핸드폰에서 열어도 키 입력 없이 즉시 카카오맵이 켜집니다!
+const DEFAULT_KAKAO_JS_KEY = "";
 
 // 현재 앱 상태
 const state = {
@@ -14,6 +18,12 @@ const state = {
   engine: "preview", // "kakao" | "preview"
   showRouteLine: true,
   activePlaceId: null,
+  // 실시간 자동 동선 추적 상태
+  isAutoTracking: false,
+  watchId: null,
+  wakeLock: null,
+  lastAutoPoint: null,
+  lastAutoTimeMs: 0,
   // 지도 인스턴스 및 오버레이 보관함
   kakaoMap: null,
   kakaoOverlays: [],
@@ -173,10 +183,10 @@ function getCurrentRecords() {
 // 지도 엔진 초기화 (카카오맵 SDK vs 미리보기 지도)
 // ===================================================
 function initMapEngine() {
-  const savedKakaoKey = localStorage.getItem(STORAGE_KEY_API);
-  if (savedKakaoKey && savedKakaoKey.trim().length > 10) {
-    document.getElementById("kakaoKeyInput").value = savedKakaoKey.trim();
-    loadKakaoMapSdk(savedKakaoKey.trim());
+  const savedKakaoKey = (localStorage.getItem(STORAGE_KEY_API) || DEFAULT_KAKAO_JS_KEY || "").trim();
+  if (savedKakaoKey.length > 10) {
+    document.getElementById("kakaoKeyInput").value = savedKakaoKey;
+    loadKakaoMapSdk(savedKakaoKey);
   } else {
     initPreviewLeafletMap();
   }
@@ -732,7 +742,7 @@ function recordCurrentGpsLocation() {
 
   const btn = document.getElementById("btnTrackGps");
   const originalText = btn.innerHTML;
-  btn.innerHTML = "<span>⏳</span> 위치 찾는 중...";
+  btn.innerHTML = "<span>⏳</span> 측정중";
 
   navigator.geolocation.getCurrentPosition(
     (pos) => {
@@ -757,6 +767,171 @@ function recordCurrentGpsLocation() {
     },
     { enableHighAccuracy: true, timeout: 8000 }
   );
+}
+
+// ===================================================
+// 🟢 실시간 자동 동선 추적 (watchPosition + WakeLock)
+// ===================================================
+function toggleAutoTracking() {
+  if (state.isAutoTracking) {
+    stopAutoTracking();
+  } else {
+    startAutoTracking();
+  }
+}
+
+async function startAutoTracking() {
+  if (!navigator.geolocation) {
+    alert("이 브라우저에서는 GPS 기능을 지원하지 않아요 😢");
+    return;
+  }
+
+  state.isAutoTracking = true;
+  localStorage.setItem(STORAGE_KEY_AUTOTRACK, "true");
+  updateAutoTrackUI();
+
+  // 화면 꺼짐 방지(Wake Lock) 요청 (지원하는 모바일 브라우저에서 화면 유지)
+  if ("wakeLock" in navigator) {
+    try {
+      state.wakeLock = await navigator.wakeLock.request("screen");
+    } catch (e) {
+      // 권한 거부나 미지원 시 무시
+    }
+  }
+
+  state.watchId = navigator.geolocation.watchPosition(
+    handleAutoTrackPosition,
+    (err) => {
+      console.warn("자동 동선 추적 오류:", err.message);
+    },
+    {
+      enableHighAccuracy: true,
+      maximumAge: 10000,
+      timeout: 15000,
+    }
+  );
+}
+
+function stopAutoTracking() {
+  state.isAutoTracking = false;
+  localStorage.setItem(STORAGE_KEY_AUTOTRACK, "false");
+  if (state.watchId !== null) {
+    navigator.geolocation.clearWatch(state.watchId);
+    state.watchId = null;
+  }
+  if (state.wakeLock) {
+    state.wakeLock.release().catch(() => {});
+    state.wakeLock = null;
+  }
+  updateAutoTrackUI();
+}
+
+function updateAutoTrackUI() {
+  const btn = document.getElementById("btnAutoTrack");
+  const text = document.getElementById("autoTrackText");
+  const banner = document.getElementById("autoTrackBanner");
+  if (!btn || !text || !banner) return;
+
+  if (state.isAutoTracking) {
+    btn.classList.add("active");
+    text.textContent = "자동 기록 중 (끄기)";
+    banner.classList.remove("hidden");
+  } else {
+    btn.classList.remove("active");
+    text.textContent = "자동 동선기록 켜기";
+    banner.classList.add("hidden");
+  }
+}
+
+function handleAutoTrackPosition(pos) {
+  const lat = Number(pos.coords.latitude.toFixed(6));
+  const lng = Number(pos.coords.longitude.toFixed(6));
+  const nowMs = Date.now();
+  const timeStr = getCurrentTimeString(0);
+
+  // 오늘 날짜로 맞춤
+  const today = getTodayString();
+  if (!state.recordsByDate[today]) {
+    state.recordsByDate[today] = [];
+  }
+  const list = state.recordsByDate[today];
+
+  // 직전 기록 지점과의 거리 계산
+  if (state.lastAutoPoint) {
+    const distKm = getDistanceKm(state.lastAutoPoint.lat, state.lastAutoPoint.lng, lat, lng);
+    const distMeters = distKm * 1000;
+
+    // 40m 이내에 머물고 있으면 마지막 자동 기록 장소의 머문 끝 시간(departureTime)만 최신화!
+    if (distMeters < 40) {
+      const lastItem = list.find((r) => r.id === state.lastAutoPoint.id);
+      if (lastItem) {
+        lastItem.departureTime = timeStr;
+        saveDataToStorage();
+        if (state.currentDate === today) renderAll();
+      }
+      return;
+    }
+
+    // 이동 속도로 이동수단 자동 추정 (km/h)
+    const elapsedHours = Math.max((nowMs - state.lastAutoTimeMs) / 3600000, 0.001);
+    const speedKmh = distKm / elapsedHours;
+    let estimatedTransport = "🚶 도보";
+    if (speedKmh >= 22) {
+      estimatedTransport = "🚗 자동차/택시";
+    } else if (speedKmh >= 8) {
+      estimatedTransport = "🚲 자전거/킥보드";
+    }
+
+    addAutoTrackedPlace({ lat, lng, timeStr, transport: estimatedTransport, today });
+  } else {
+    // 첫 자동 기록 지점 생성
+    addAutoTrackedPlace({ lat, lng, timeStr, transport: "🚶 도보", today });
+  }
+
+  state.lastAutoTimeMs = nowMs;
+}
+
+function addAutoTrackedPlace({ lat, lng, timeStr, transport, today }) {
+  const list = state.recordsByDate[today];
+  const autoCount = list.filter((item) => String(item.id).startsWith("auto-")).length + 1;
+  const newId = "auto-" + Date.now();
+
+  const newRecord = {
+    id: newId,
+    name: `자동 기록 지점 #${autoCount}`,
+    category: "📌 기타",
+    transport,
+    arrivalTime: timeStr,
+    departureTime: timeStr,
+    address: `위도 ${lat}, 경도 ${lng}`,
+    lat,
+    lng,
+    memo: "이동 중 자동으로 기록된 동선이에요 🟢",
+  };
+
+  list.push(newRecord);
+  state.lastAutoPoint = { id: newId, lat, lng };
+  saveDataToStorage();
+
+  // 카카오 역지오코딩이 가능하면 실제 도로명/지번 주소로 자동 업데이트!
+  if (state.engine === "kakao" && state.kakaoGeocoder) {
+    state.kakaoGeocoder.coord2Address(lng, lat, (result, status) => {
+      if (status === kakao.maps.services.Status.OK && result[0]) {
+        const addr = result[0].road_address
+          ? result[0].road_address.address_name
+          : result[0].address.address_name;
+        newRecord.address = addr;
+        newRecord.name = addr.split(" ").slice(-2).join(" ") || newRecord.name;
+        saveDataToStorage();
+        if (state.currentDate === today) renderAll();
+      }
+    });
+  }
+
+  if (state.currentDate === today) {
+    renderAll();
+    focusOnPlace(newRecord);
+  }
 }
 
 // ===================================================
@@ -913,7 +1088,11 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btnNextDay").addEventListener("click", () => shiftDate(1));
   document.getElementById("btnToday").addEventListener("click", () => setDate(getTodayString()));
 
-  // 장소 추가 / GPS / 샘플 불러오기 버튼
+  // 자동 동선 추적 / 장소 추가 / GPS / 샘플 불러오기 버튼
+  const btnAutoTrack = document.getElementById("btnAutoTrack");
+  if (btnAutoTrack) {
+    btnAutoTrack.addEventListener("click", toggleAutoTracking);
+  }
   document.getElementById("btnAddPlace").addEventListener("click", () => openPlaceModalForCreate());
   document.getElementById("btnTrackGps").addEventListener("click", recordCurrentGpsLocation);
   document.getElementById("btnLoadSample").addEventListener("click", () => {

@@ -59,15 +59,22 @@
 
       <!-- 액션 버튼 영역 -->
       <div class="action-bar">
-        <button id="btnAddPlace" class="action-btn primary">
-          <span>➕</span> 장소 추가
+        <button id="btnAutoTrack" class="action-btn autotrack">
+          <span id="autoTrackDot" class="pulse-dot"></span>
+          <span id="autoTrackText">자동 동선기록 켜기</span>
         </button>
-        <button id="btnTrackGps" class="action-btn gps">
-          <span>🛰️</span> 현재 위치 기록
+        <button id="btnAddPlace" class="action-btn primary">
+          <span>➕</span> 수동 추가
+        </button>
+        <button id="btnTrackGps" class="action-btn gps" title="지금 위치 즉시 스탬프">
+          <span>🛰️</span> 현위치
         </button>
         <button id="btnLoadSample" class="action-btn secondary" title="예시 타임라인 불러오기">
-          <span>✨</span> 예시 보기
+          <span>✨</span> 예시
         </button>
+      </div>
+      <div id="autoTrackBanner" class="autotrack-banner hidden">
+        🟢 <strong>실시간 자동 동선 기록 중!</strong> 이동하면 자동으로 경로가 저장돼요. (화면 켜짐 유지 중)
       </div>
 
       <!-- 타임라인 리스트 영역 (시간순 발자취) -->
